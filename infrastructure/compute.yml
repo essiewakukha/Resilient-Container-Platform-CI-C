@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient Container Platform - Compute Stack
+  ECS Fargate cluster spanning 2 AZs, ALB, web service (scales on ALB
+  request count) and worker service (scales on SQS queue depth).
+  Depends on network, data, and messaging stacks being deployed first.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: resilient-platform
+  WebImage:
+    Type: String
+    Default: public.ecr.aws/nginx/nginx:latest
+    Description: Placeholder image until the pipeline pushes the real web app image to ECR
+  WorkerImage:
+    Type: String
+    Default: public.ecr.aws/docker/library/busybox:latest
+    Description: Placeholder image until the pipeline pushes the real worker image to ECR
+  ContainerPort:
+    Type: Number
+    Default: 80
+  WebDesiredCount:
+    Type: Number
+    Default: 2
+  WorkerDesiredCount:
+    Type: Number
+    Default: 1
+  WebMinCapacity:
+    Type: Number
+    Default: 2
+  WebMaxCapacity:
+    Type: Number
+    Default: 6
+  WorkerMinCapacity:
+    Type: Number
+    Default: 1
+  WorkerMaxCapacity:
+    Type: Number
+    Default: 6
+  DBName:
+    Type: String
+    Default: appdb
+
+Resources:
+
+  # ---------- ECS Cluster ----------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ---------- ALB ----------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTP from the internet to the ALB
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-sg
+
+  # Allow ECS app tasks to receive traffic from the ALB only
+  AppIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: ${ProjectName}-AppSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-PublicSubnet1Id
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-PublicSubnet2Id
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-web-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # ---------- IAM ----------
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  WebTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WebTaskPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !ImportValue
+                  Fn::Sub: ${ProjectName}-TasksQueueArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: ${ProjectName}-DBSecretArn
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WorkerTaskPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !ImportValue
+                  Fn::Sub: ${ProjectName}-TasksQueueArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: ${ProjectName}-DBSecretArn
+
+  # ---------- Logs ----------
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-web
+      RetentionInDays: 14
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-worker
+      RetentionInDays: 14
+
+  # ---------- Web Task Definition + Service ----------
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-web
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt WebTaskRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref WebImage
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-DBEndpointAddress
+            - Name: DB_PORT
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-DBEndpointPort
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_SECRET_ARN
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-DBSecretArn
+            - Name: REDIS_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-RedisPrimaryEndpoint
+            - Name: REDIS_PORT
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-RedisPort
+            - Name: SQS_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-TasksQueueUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  WebService:
+    Type: AWS::ECS::Service
+    DependsOn: WebListener
+    Properties:
+      ServiceName: !Sub ${ProjectName}-web
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WebTaskDefinition
+      DesiredCount: !Ref WebDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-PrivateSubnet1Id
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-PrivateSubnet2Id
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # ---------- Worker Task Definition + Service ----------
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-worker
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Ref WorkerImage
+          Command:
+            - sleep
+            - '3600'
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-DBEndpointAddress
+            - Name: DB_PORT
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-DBEndpointPort
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: DB_SECRET_ARN
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-DBSecretArn
+            - Name: SQS_QUEUE_URL
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-TasksQueueUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-worker
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: !Ref WorkerDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-PrivateSubnet1Id
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-PrivateSubnet2Id
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${ProjectName}-AppSecurityGroupId
+
+  # ---------- Web Auto Scaling: target-track on ALB requests per target ----------
+  WebScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub service/${ECSCluster}/${WebService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref WebMinCapacity
+      MaxCapacity: !Ref WebMaxCapacity
+
+  WebScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-web-alb-requests
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WebScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 100
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub ${ApplicationLoadBalancer.LoadBalancerFullName}/${WebTargetGroup.TargetGroupFullName}
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+  # ---------- Worker Auto Scaling: target-track on SQS queue depth ----------
+  WorkerScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub service/${ECSCluster}/${WorkerService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref WorkerMinCapacity
+      MaxCapacity: !Ref WorkerMaxCapacity
+
+  WorkerScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-worker-queue-depth
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WorkerScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 10
+        CustomizedMetricSpecification:
+          MetricName: ApproximateNumberOfMessagesVisible
+          Namespace: AWS/SQS
+          Dimensions:
+            - Name: QueueName
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-TasksQueueName
+          Statistic: Average
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+Outputs:
+  ClusterName:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ProjectName}-ClusterName
+
+  ALBDNSName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-ALBDNSName
+
+  ALBArn:
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub ${ProjectName}-ALBArn
+
+  ALBFullName:
+    Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+    Export:
+      Name: !Sub ${ProjectName}-ALBFullName
+
+  WebServiceName:
+    Value: !GetAtt WebService.Name
+    Export:
+      Name: !Sub ${ProjectName}-WebServiceName
+
+  WorkerServiceName:
+    Value: !GetAtt WorkerService.Name
+    Export:
+      Name: !Sub ${ProjectName}-WorkerServiceName
