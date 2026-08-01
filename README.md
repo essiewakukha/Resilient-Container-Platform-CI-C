@@ -21,7 +21,7 @@ A containerized e-commerce platform on Amazon ECS Fargate, built to survive Avai
 
 ## Architecture
 
-![Runtime architecture](./docs/architecture-runtime.png)
+![Runtime architecture](./docs/architecture.png)
 
 
 **Traffic flow:** Internet → Route 53 (health-checked failover) → Application Load Balancer (2 AZs) → ECS Fargate web service (2 AZs) → RDS MySQL Multi-AZ + ElastiCache Redis (cache-aside reads). The web tier pushes order-processing tasks to SQS; a separate ECS Fargate worker service consumes them asynchronously and writes results back to RDS.
