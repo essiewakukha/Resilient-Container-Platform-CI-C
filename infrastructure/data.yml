@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient Container Platform - Data Stack
+  RDS MySQL Multi-AZ instance and ElastiCache Redis replication group
+  (with automatic failover), both deployed into the private subnets
+  from the network stack. Also creates AppSecurityGroup, which the
+  compute stack's ECS tasks will use to reach these resources.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: resilient-platform
+  DBName:
+    Type: String
+    Default: appdb
+  DBUsername:
+    Type: String
+    Default: admin
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+
+Resources:
+
+  # ---------- Security group shared by ECS tasks (compute.yaml attaches this) ----------
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS tasks (web + worker) that need DB/cache access
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app-sg
+
+  # ---------- RDS ----------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS Multi-AZ
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-PrivateSubnet1Id
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db-subnet-group
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from ECS app tasks only
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db-sg
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-db
+      Engine: mysql
+      EngineVersion: '8.0.46'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true
+      MultiAZ: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      BackupRetentionPeriod: 7
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-db
+
+  # ---------- ElastiCache Redis (replication group = HA with automatic failover) ----------
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Private subnets for ElastiCache Redis
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-PrivateSubnet1Id
+        - !ImportValue
+          Fn::Sub: ${ProjectName}-PrivateSubnet2Id
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Redis access from ECS app tasks only
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-redis-sg
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${ProjectName}-redis
+      ReplicationGroupDescription: Redis cache with Multi-AZ automatic failover
+      Engine: redis
+      EngineVersion: '7.1'
+      CacheNodeType: !Ref RedisNodeType
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-redis
+
+Outputs:
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-AppSecurityGroupId
+
+  DBEndpointAddress:
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-DBEndpointAddress
+
+  DBEndpointPort:
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-DBEndpointPort
+
+  DBSecretArn:
+    Description: Secrets Manager ARN holding the RDS master credentials (auto-managed by RDS)
+    Value: !GetAtt DBInstance.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub ${ProjectName}-DBSecretArn
+
+  RedisPrimaryEndpoint:
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-RedisPrimaryEndpoint
+
+  RedisPort:
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-RedisPort
