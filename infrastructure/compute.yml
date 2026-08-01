@@ -299,6 +299,12 @@ Resources:
             - Name: SQS_QUEUE_URL
               Value: !ImportValue
                 Fn::Sub: ${ProjectName}-TasksQueueUrl
+            - Name: REDIS_HOST
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-RedisPrimaryEndpoint
+            - Name: REDIS_PORT
+              Value: !ImportValue
+                Fn::Sub: ${ProjectName}-RedisPort
           LogConfiguration:
             LogDriver: awslogs
             Options:
