@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient Container Platform - Disaster Recovery Stack
+  AWS Backup plan for automated RDS snapshots, and Route 53 DNS failover
+  routing (primary -> ALB, secondary -> S3 static error page) driven by
+  a health check on the ALB. Uses a private hosted zone since no public
+  domain is registered for this project; failover is demonstrated via
+  the Route 53 test-dns-answer API rather than a public browser test.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: resilient-platform
+  HostedZoneName:
+    Type: String
+    Default: resilient-platform.internal
+  RecordName:
+    Type: String
+    Default: app
+  BackupRetentionDays:
+    Type: Number
+    Default: 35
+
+Mappings:
+  # AWS-published static mapping of S3 website-endpoint hosted zone IDs by region.
+  # Needed because S3 website endpoints (unlike REST endpoints) require this for Alias records.
+  RegionMap:
+    us-east-1:
+      S3WebsiteHostedZoneId: Z3AQBSTGFYJSTF
+    us-east-2:
+      S3WebsiteHostedZoneId: Z2O1EMRO9K5GLX
+    us-west-1:
+      S3WebsiteHostedZoneId: Z2F56UZL2M1ACD
+    us-west-2:
+      S3WebsiteHostedZoneId: Z3BJ6K6RIION7M
+    eu-west-1:
+      S3WebsiteHostedZoneId: Z1BKCTXD74EZPE
+    ap-southeast-1:
+      S3WebsiteHostedZoneId: Z3O0J2DXBE1FTB
+    ap-southeast-2:
+      S3WebsiteHostedZoneId: Z1WCIGYICN2BYD
+    ap-northeast-1:
+      S3WebsiteHostedZoneId: Z2M4EHUR26P7ZW
+
+Resources:
+
+  # ---------- AWS Backup ----------
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub ${ProjectName}-backup-vault
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub ${ProjectName}-daily-backup-plan
+        BackupPlanRule:
+          - RuleName: DailyRDSBackup
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 5 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: !Ref BackupRetentionDays
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: !Sub ${ProjectName}-rds-selection
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${ProjectName}-db
+
+  # ---------- S3 static failover page ----------
+  FailoverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-failover-page-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FailoverBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FailoverBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub ${FailoverBucket.Arn}/*
+
+  # ---------- Route 53 (private hosted zone - no public domain registered) ----------
+  HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !ImportValue
+          Fn::Sub: ${ProjectName}-ALBDNSName
+        Port: 80
+        ResourcePath: /
+        RequestInterval: 30
+        FailureThreshold: 3
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-health-check
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref HostedZoneName
+      VPCs:
+        - VPCId: !ImportValue
+            Fn::Sub: ${ProjectName}-VpcId
+          VPCRegion: !Ref AWS::Region
+
+  PrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub ${RecordName}.${HostedZoneName}
+      Type: A
+      SetIdentifier: primary
+      Failover: PRIMARY
+      HealthCheckId: !Ref HealthCheck
+      AliasTarget:
+        HostedZoneId: !ImportValue
+          Fn::Sub: ${ProjectName}-ALBCanonicalHostedZoneID
+        DNSName: !ImportValue
+          Fn::Sub: ${ProjectName}-ALBDNSName
+        EvaluateTargetHealth: true
+
+  SecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub ${RecordName}.${HostedZoneName}
+      Type: A
+      SetIdentifier: secondary
+      Failover: SECONDARY
+      AliasTarget:
+        HostedZoneId: !FindInMap [RegionMap, !Ref AWS::Region, S3WebsiteHostedZoneId]
+        DNSName: !Sub ${FailoverBucket}.s3-website.${AWS::Region}.amazonaws.com
+        EvaluateTargetHealth: false
+
+Outputs:
+  BackupVaultName:
+    Value: !Ref BackupVault
+    Export:
+      Name: !Sub ${ProjectName}-BackupVaultName
+
+  BackupPlanId:
+    Value: !Ref BackupPlan
+    Export:
+      Name: !Sub ${ProjectName}-BackupPlanId
+
+  FailoverBucketName:
+    Value: !Ref FailoverBucket
+    Export:
+      Name: !Sub ${ProjectName}-FailoverBucketName
+
+  HealthCheckId:
+    Value: !Ref HealthCheck
+    Export:
+      Name: !Sub ${ProjectName}-HealthCheckId
+
+  PrivateHostedZoneId:
+    Value: !Ref PrivateHostedZone
+    Export:
+      Name: !Sub ${ProjectName}-PrivateHostedZoneId
+
+  FailoverRecordName:
+    Description: Query this name with `aws route53 test-dns-answer` to see failover in action
+    Value: !Sub ${RecordName}.${HostedZoneName}
