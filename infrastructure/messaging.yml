@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient Container Platform - Messaging Stack
+  SQS queue that buffers order-processing tasks pushed by the web app,
+  consumed by the worker ECS service. Includes a dead-letter queue for
+  messages that repeatedly fail processing.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: resilient-platform
+  VisibilityTimeoutSeconds:
+    Type: Number
+    Default: 60
+    Description: >
+      Should be >= the worker's expected processing time. If the worker
+      hasn't deleted the message within this window, SQS makes it visible
+      to other consumers again.
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    Description: Number of failed processing attempts before a message moves to the DLQ
+
+Resources:
+
+  TasksDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-tasks-dlq
+      MessageRetentionPeriod: 1209600 # 14 days, max retention 
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-tasks-dlq
+
+  TasksQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-tasks
+      VisibilityTimeout: !Ref VisibilityTimeoutSeconds
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TasksDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-tasks
+
+  # Alarm on DLQ depth - if messages are landing here, tasks are failing
+  # repeatedly and someone should look. 
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-dlq-messages-present
+      AlarmDescription: Triggers when any message lands in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt TasksDeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  TasksQueueUrl:
+    Value: !Ref TasksQueue
+    Export:
+      Name: !Sub ${ProjectName}-TasksQueueUrl
+
+  TasksQueueArn:
+    Value: !GetAtt TasksQueue.Arn
+    Export:
+      Name: !Sub ${ProjectName}-TasksQueueArn
+
+  TasksQueueName:
+    Value: !GetAtt TasksQueue.QueueName
+    Export:
+      Name: !Sub ${ProjectName}-TasksQueueName
+
+  DeadLetterQueueArn:
+    Value: !GetAtt TasksDeadLetterQueue.Arn
+    Export:
+      Name: !Sub ${ProjectName}-DeadLetterQueueArn
