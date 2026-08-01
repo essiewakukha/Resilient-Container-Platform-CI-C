@@ -400,6 +400,11 @@ Outputs:
     Export:
       Name: !Sub ${ProjectName}-ALBFullName
 
+  ALBCanonicalHostedZoneID:
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub ${ProjectName}-ALBCanonicalHostedZoneID
+
   WebServiceName:
     Value: !GetAtt WebService.Name
     Export:
