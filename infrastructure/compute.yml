@@ -282,8 +282,8 @@ Resources:
         - Name: worker
           Image: !Ref WorkerImage
           Command:
-            - sleep
-            - '3600'
+            - node
+            - worker.js
           Environment:
             - Name: DB_HOST
               Value: !ImportValue
