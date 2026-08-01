@@ -1,0 +1,16 @@
+{
+  "name": "resilient-platform-web",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@aws-sdk/client-sqs": "^3.600.0",
+    "express": "^4.19.2",
+    "mysql2": "^3.10.0",
+    "redis": "^4.6.14"
+  }
+}
