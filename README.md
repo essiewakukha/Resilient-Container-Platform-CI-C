@@ -91,7 +91,7 @@ CodePipeline sources from GitHub via CodeStar Connections, builds both the web a
 - **Web service** scales on `ALBRequestCountPerTarget` (target: 100 requests/target), min 2 / max 6 tasks.
 - **Worker service** scales on SQS `ApproximateNumberOfMessagesVisible` (target: 10 messages), min 1 / max 6 tasks.
 
-![CloudWatch scaling metrics](./docs/scaling-proof.png)
+![CloudWatch scaling metrics](./docs/scaling-proof.webp)
 
 *Captured by generating sustained load against the web tier and a backlog of orders against the worker tier, then screenshotting CloudWatch task-count metrics rising alongside ALB request count / SQS queue depth.*
 
@@ -117,7 +117,9 @@ aws elbv2 describe-target-health --target-group-arn <web-target-group-arn>
 ```
 
 **Before (healthy, all checker regions):**
+![Health check success](./docs/dr-success.png)
 ```json
+
 {
   "Region": "ap-southeast-2",
   "StatusReport": {
@@ -125,9 +127,10 @@ aws elbv2 describe-target-health --target-group-arn <web-target-group-arn>
   }
 }
 ```
-
+![Health check success](./docs/dr-failure.png)
 **After (web service scaled to 0):**
 ```json
+
 {
   "Region": "ap-southeast-2",
   "StatusReport": {
